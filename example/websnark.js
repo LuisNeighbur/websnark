@@ -2032,6 +2032,10 @@ var bigInt = (function (undefined) {
         if (mod.isZero()) throw new Error("Cannot take modPow with modulus 0");
         var r = Integer[1],
             base = this.mod(mod);
+        if (exp.isNegative()) {
+            exp = exp.multiply(Integer[-1]);
+            base = base.modInv(mod);
+        }
         while (exp.isPositive()) {
             if (base.isZero()) return Integer[0];
             if (exp.isOdd()) r = r.multiply(base).mod(mod);
@@ -2275,13 +2279,13 @@ var bigInt = (function (undefined) {
     };
     NativeBigInt.prototype.isPrime = SmallInteger.prototype.isPrime = BigInteger.prototype.isPrime;
 
-    BigInteger.prototype.isProbablePrime = function (iterations) {
+    BigInteger.prototype.isProbablePrime = function (iterations, rng) {
         var isPrime = isBasicPrime(this);
         if (isPrime !== undefined) return isPrime;
         var n = this.abs();
         var t = iterations === undefined ? 5 : iterations;
         for (var a = [], i = 0; i < t; i++) {
-            a.push(bigInt.randBetween(2, n.minus(2)));
+            a.push(bigInt.randBetween(2, n.minus(2), rng));
         }
         return millerRabinTest(n, a);
     };
@@ -2513,19 +2517,20 @@ var bigInt = (function (undefined) {
         b = parseValue(b).abs();
         return a.divide(gcd(a, b)).multiply(b);
     }
-    function randBetween(a, b) {
+    function randBetween(a, b, rng) {
         a = parseValue(a);
         b = parseValue(b);
+        var usedRNG = rng || Math.random;
         var low = min(a, b), high = max(a, b);
         var range = high.subtract(low).add(1);
-        if (range.isSmall) return low.add(Math.floor(Math.random() * range));
+        if (range.isSmall) return low.add(Math.floor(usedRNG() * range));
         var digits = toBase(range, BASE).value;
         var result = [], restricted = true;
         for (var i = 0; i < digits.length; i++) {
-            var top = restricted ? digits[i] : BASE;
-            var digit = truncate(Math.random() * top);
+            var top = restricted ? digits[i] + (i + 1 < digits.length ? digits[i + 1] / BASE : 0) : BASE;
+            var digit = truncate(usedRNG() * top);
             result.push(digit);
-            if (digit < top) restricted = false;
+            if (digit < digits[i]) restricted = false;
         }
         return low.add(Integer.fromArray(result, BASE, false));
     }
@@ -2791,7 +2796,7 @@ if (typeof module !== "undefined" && module.hasOwnProperty("exports")) {
 
 //amd check
 if (typeof define === "function" && define.amd) {
-    define("big-integer", [], function () {
+    define( function () {
         return bigInt;
     });
 }
@@ -5122,6 +5127,14 @@ if (typeof(BigInt) != "undefined") {
         return this % c;
     };
 
+    wBigInt.prototype.pow = function(c) {
+        return this ** c;
+    };
+
+    wBigInt.prototype.abs = function() {
+        return (this > wBigInt.zero) ? this : -this;
+    };
+
     wBigInt.prototype.modPow = function(e, m) {
         let acc = wBigInt.one;
         let exp = this;
@@ -5162,6 +5175,11 @@ if (typeof(BigInt) != "undefined") {
     wBigInt.prototype.neq = function(b) {
         return this != b;
     };
+
+    wBigInt.prototype.toJSNumber = function() {
+        return Number(this);
+    };
+
 
 } else {
 
@@ -5423,6 +5441,33 @@ wBigInt.prototype.leInt2Buff = function (len) {
 };
 
 
+wBigInt.beBuff2int = function(buff) {
+    let res = wBigInt.zero;
+    for (let i=0; i<buff.length; i++) {
+        const n = wBigInt(buff[buff.length - i - 1]);
+        res = res.add(n.shl(i*8));
+    }
+    return res;
+};
+
+wBigInt.beInt2Buff = function(n, len) {
+    let r = n;
+    let o =len-1;
+    const buff = Buffer.alloc(len);
+    while ((r.greater(wBigInt.zero))&&(o>=0)) {
+        let c = Number(r.and(wBigInt("255")));
+        buff[o] = c;
+        o--;
+        r = r.shr(8);
+    }
+    if (r.greater(wBigInt.zero)) throw new Error("Number does not feed in buffer");
+    return buff;
+};
+
+wBigInt.prototype.beInt2Buff = function (len) {
+    return wBigInt.beInt2Buff(this,len);
+};
+
 module.exports = wBigInt;
 
 
@@ -5451,9 +5496,10 @@ const bigInt = require("./bigint");
 
 module.exports = calculateWitness;
 
-function calculateWitness(circuit, inputSignals, log) {
-    log = log || (() => {});
-    const ctx = new RTCtx(circuit, log);
+function calculateWitness(circuit, inputSignals, options) {
+    options = options || {};
+    if (!options.logFunction) options.logFunction = console.log;
+    const ctx = new RTCtx(circuit, options);
 
     function iterateSelector(values, sels, cb) {
         if (!Array.isArray(values)) {
@@ -5492,15 +5538,15 @@ function calculateWitness(circuit, inputSignals, log) {
         if (typeof(ctx.witness[i]) == "undefined") {
             throw new Error("Signal not assigned: " + circuit.signalNames(i));
         }
-        log(circuit.signalNames(i) + " --> " + ctx.witness[i].toString());
+        if (options.logOutput) options.logFunction(circuit.signalNames(i) + " --> " + ctx.witness[i].toString());
     }
     return ctx.witness.slice(0, circuit.nVars);
 //    return ctx.witness;
 }
 
 class RTCtx {
-    constructor(circuit, log) {
-        this.log = log || function() {};
+    constructor(circuit, options) {
+        this.options = options;
         this.scopes = [];
         this.circuit = circuit;
         this.witness = new Array(circuit.nSignals);
@@ -5534,8 +5580,7 @@ class RTCtx {
     }
 
     triggerComponent(c) {
-        this.log("Component Treiggered: " + this.circuit.components[c].name);
-//        console.log("Start Component Treiggered: " + this.circuit.components[c].name);
+        if (this.options.logTrigger) this.options.logFunction("Component Treiggered: " + this.circuit.components[c].name);
 
         // Set notInitSignals to -1 to not initialize again
         this.notInitSignals[c] --;
@@ -5556,7 +5601,8 @@ class RTCtx {
         this.circuit.templates[template](this);
         this.scopes = oldScope;
         this.currentComponent = oldComponent;
-//        console.log("End Component Treiggered: " + this.circuit.components[c].name);
+
+        if (this.options.logTrigger)  this.options.logFunction("End Component Treiggered: " + this.circuit.components[c].name);
     }
 
     callFunction(functionName, params) {
@@ -5579,7 +5625,7 @@ class RTCtx {
     }
 
     setSignalFullName(fullName, value) {
-        this.log("set " + fullName + " <-- " + value.toString());
+        if (this.options.logSet) this.options.logFunction("set " + fullName + " <-- " + value.toString());
         const sId = this.circuit.getSignalIdx(fullName);
         let firstInit =false;
         if (typeof(this.witness[sId]) == "undefined") {
@@ -5648,15 +5694,15 @@ class RTCtx {
         if (typeof(this.witness[sId]) == "undefined") {
             throw new Error("Signal not initialized: "+fullName);
         }
-        this.log("get --->" + fullName + " = " + this.witness[sId].toString() );
+        if (this.options.logGet) this.options.logFunction("get --->" + fullName + " = " + this.witness[sId].toString() );
         return this.witness[sId];
     }
 
-    assert(a,b) {
+    assert(a,b,errStr) {
         const ba = bigInt(a);
         const bb = bigInt(b);
         if (!ba.equals(bb)) {
-            throw new Error("Constraint doesn't match: " + ba.toString() + " != " + bb.toString());
+            throw new Error("Constraint doesn't match "+ this.currentComponent+": "+ errStr + " -> "+ ba.toString() + " != " + bb.toString());
         }
     }
 }
@@ -5880,7 +5926,7 @@ module.exports.stringifyBigInts = stringifyBigInts;
 module.exports.unstringifyBigInts = unstringifyBigInts;
 
 function stringifyBigInts(o) {
-    if ((typeof(o) == "bigint") || (o instanceof bigInt))  {
+    if ((typeof(o) == "bigint") || o.isZero !== undefined)  {
         return o.toString(10);
     } else if (Array.isArray(o)) {
         return o.map(stringifyBigInts);
@@ -5984,7 +6030,7 @@ function thread(self) {
         const res = i32[0];
         i32[0] += length;
         while (i32[0] > memory.buffer.byteLength) {
-          memory.grow(100);
+            memory.grow(100);
         }
         i32 = new Uint32Array(memory.buffer);
         return res;
@@ -6084,8 +6130,11 @@ function thread(self) {
     };
 }
 
-async function build() {
-
+// We use the Object.assign approach for the backwards compatibility
+// @params Number wasmInitialMemory 
+async function build(params) {
+    const defaultParams = { wasmInitialMemory: 5000 };
+    Object.assign(defaultParams, params);
     const groth16 = new Groth16();
 
     groth16.q = bigInt("21888242871839275222246405745257275088696311157297823662689037894645226208583");
@@ -6094,7 +6143,7 @@ async function build() {
     groth16.n32 = groth16.n64*2;
     groth16.n8 = groth16.n64*8;
 
-    groth16.memory = new WebAssembly.Memory({initial:5000});
+    groth16.memory = new WebAssembly.Memory({initial:defaultParams.wasmInitialMemory});
     groth16.i32 = new Uint32Array(groth16.memory.buffer);
 
     const wasmModule = await WebAssembly.compile(groth16_wasm.code);
@@ -6162,7 +6211,7 @@ async function build() {
         const copyCode = groth16_wasm.code.buffer.slice(0);
         initPromises.push(groth16.postAction(i, {
             command: "INIT",
-            init: 5000,
+            init: defaultParams.wasmInitialMemory,
             code: copyCode
 
         }, [copyCode]));
@@ -6407,7 +6456,7 @@ class Groth16 {
 
 
         const pH = this.calcH(signals.slice(0), polsA, polsB, nSignals, domainSize).then( (h) => {
-/* Debug code to print the result of h
+            /* Debug code to print the result of h
             for (let i=0; i<domainSize; i++) {
                 const a = this.bin2int(h.slice(i*32, i*32+32));
                 console.log(i + " -> " + a.toString());
@@ -6462,9 +6511,9 @@ class Groth16 {
             this.putBin(ps, bs);
         }
 
-/// Uncoment it to debug and check it works
-//        this.instance.exports.f1m_zero(pr);
-//        this.instance.exports.f1m_zero(ps);
+        /// Uncoment it to debug and check it works
+        //        this.instance.exports.f1m_zero(pr);
+        //        this.instance.exports.f1m_zero(ps);
 
         // pi_a = pi_a + Alfa1 + r*Delta1
         this.instance.exports.g1_add(pAlfa1, pi_a, pi_a);
@@ -6547,6 +6596,8 @@ const bigInt = require("big-integer");
 const Circuit = require("snarkjs/src/circuit");
 const bigInt2 = require("snarkjs/src/bigint");
 const hexifyBigInts = require("../tools/stringifybigint").hexifyBigInts;
+const unhexifyBigInts = require("../tools/stringifybigint").unhexifyBigInts;
+const stringifyBigInts = require("../tools/stringifybigint").stringifyBigInts;
 const unstringifyBigInts = require("../tools/stringifybigint").unstringifyBigInts;
 const stringifyBigInts2 = require("snarkjs/src/stringifybigint").stringifyBigInts;
 const unstringifyBigInts2 = require("snarkjs/src/stringifybigint").unstringifyBigInts;
@@ -6589,21 +6640,31 @@ function convertWitness(witness) {
     return buff;
 }
 
+function toHex32(number) {
+    let str = number.toString(16);
+    while (str.length < 64) str = "0" + str;
+    return str;
+}
+
 function toSolidityInput(proof) {
+    const flatProof = unstringifyBigInts([
+        proof.pi_a[0], proof.pi_a[1],
+        proof.pi_b[0][1], proof.pi_b[0][0],
+        proof.pi_b[1][1], proof.pi_b[1][0],
+        proof.pi_c[0], proof.pi_c[1],
+    ]);
     const result = {
-        pi_a: [proof.pi_a[0], proof.pi_a[1]],
-        pi_b: [[proof.pi_b[0][1], proof.pi_b[0][0]], [proof.pi_b[1][1], proof.pi_b[1][0]]],
-        pi_c: [proof.pi_c[0], proof.pi_c[1]],
+        proof: "0x" + flatProof.map(x => toHex32(x)).join("")
     };
     if (proof.publicSignals) {
-        result.publicSignals = proof.publicSignals;
+        result.publicSignals = hexifyBigInts(unstringifyBigInts(proof.publicSignals));
     }
-    return hexifyBigInts(unstringifyBigInts(result));
+    return result;
 }
 
 function  genWitness(input, circuitJson) {
     const circuit = new Circuit(unstringifyBigInts2(circuitJson));
-    const witness = circuit.calculateWitness(input);
+    const witness = circuit.calculateWitness(unstringifyBigInts2(input));
     const publicSignals = witness.slice(1, circuit.nPubInputs + circuit.nOutputs + 1);
     return {witness, publicSignals};
 }
@@ -6642,6 +6703,7 @@ const bigInt = require("big-integer");
 module.exports.stringifyBigInts = stringifyBigInts;
 module.exports.unstringifyBigInts = unstringifyBigInts;
 module.exports.hexifyBigInts = hexifyBigInts;
+module.exports.unhexifyBigInts = unhexifyBigInts;
 
 function stringifyBigInts(o) {
     if ((typeof(o) == "bigint") || (o instanceof bigInt))  {
@@ -6687,6 +6749,22 @@ function hexifyBigInts(o) {
         const res = {};
         for (let k in o) {
             res[k] = hexifyBigInts(o[k]);
+        }
+        return res;
+    } else {
+        return o;
+    }
+}
+
+function unhexifyBigInts(o) {
+    if ((typeof(o) == "string") && (/^0x[0-9a-fA-F]+$/.test(o)))  {
+        return bigInt(o);
+    } else if (Array.isArray(o)) {
+        return o.map(unhexifyBigInts);
+    } else if (typeof o == "object") {
+        const res = {};
+        for (let k in o) {
+            res[k] = unhexifyBigInts(o[k]);
         }
         return res;
     } else {
